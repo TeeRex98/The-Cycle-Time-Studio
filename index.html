@@ -107,6 +107,9 @@
 /* ---------------------------------------------------------------------- */
 var LS_MODELS = "cts_models_v1";
 var LS_RECORDS = "cts_records_v1";
+var LS_STUDIES = "cts_studies_v1";
+var LS_ACTIVE = "cts_active_v1";
+var LS_SETTINGS = "cts_settings_v1";
 var memFallback = { models: null, records: null };
 
 function lsGet(key){
@@ -161,6 +164,26 @@ function downloadText(filename, text){
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
 }
+function excelEsc(v){
+  if (v===null||v===undefined) return "";
+  return String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+function downloadExcel(filename, title, headers, rows){
+  var html = '<html><head><meta charset="UTF-8"><style>'
+    + 'table{border-collapse:collapse;font-family:Arial,sans-serif;font-size:11pt}'
+    + 'th{background:#0e6e66;color:#fff;font-weight:700}'
+    + 'th,td{border:1px solid #b9b4a8;padding:6px 8px;white-space:nowrap}'
+    + '</style></head><body><h3>'+excelEsc(title)+'</h3><table><thead><tr>'
+    + headers.map(function(h){return '<th>'+excelEsc(h)+'</th>';}).join('')
+    + '</tr></thead><tbody>'
+    + rows.map(function(row){ return '<tr>'+row.map(function(v){return '<td>'+excelEsc(v)+'</td>';}).join('')+'</tr>'; }).join('')
+    + '</tbody></table></body></html>';
+  var blob = new Blob([html], { type: "application/vnd.ms-excel;charset=utf-8;" });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a"); a.href=url; a.download=filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+}
 function splitCSVLine(line){
   var res=[], cur="", inQ=false;
   for (var i=0;i<line.length;i++){
@@ -190,6 +213,24 @@ function parseCSV(text){
   }
   return rows;
 }
+function parseExcelHtml(text){
+  var doc = new DOMParser().parseFromString(text, "text/html");
+  var table = doc.querySelector("table");
+  if (!table) return [];
+  var trs = table.querySelectorAll("tr");
+  if (!trs.length) return [];
+  var headers = Array.prototype.map.call(trs[0].children, function(c){ return c.textContent.trim(); });
+  var rows = [];
+  for (var i=1;i<trs.length;i++){
+    var cells = trs[i].children, obj = {};
+    headers.forEach(function(h,idx){ obj[h] = cells[idx] ? cells[idx].textContent.trim() : ""; });
+    rows.push(obj);
+  }
+  return rows;
+}
+function parseImportFile(text, name){
+  return /\.xls$/i.test(name) ? parseExcelHtml(text) : parseCSV(text);
+}
 
 /* tiny inline icon set (no external font/icon library needed) */
 var ICO = {
@@ -217,6 +258,9 @@ var state = {
   tab: "timer",
   models: [],
   records: [],
+  studies: [],
+  activeStudyId: null,
+  operatorName: "",
   timerModelId: null,
   timers: {},
   sessionStart: Date.now(),
@@ -228,6 +272,8 @@ var state = {
   sessionWorker: "",
   sessionLabel: "",
   sessionComment: "",
+  sessionMode: false,
+  studyMode: false,
   reportDateFrom: "",
   reportDateTo: "",
   modelsSelId: null,
@@ -273,12 +319,27 @@ function seedModels(){
 function init(){
   var m = lsGet(LS_MODELS);
   var r = lsGet(LS_RECORDS);
+  var studies = lsGet(LS_STUDIES);
+  var settings = lsGet(LS_SETTINGS) || {};
+  var active = lsGet(LS_ACTIVE);
   state.models = (m && m.length) ? m : seedModels();
   state.records = r || [];
+  state.studies = studies || [];
+  state.operatorName = settings.operatorName || "";
   if (!m || !m.length) lsSet(LS_MODELS, state.models);
   state.timerModelId = state.models[0] ? state.models[0].id : null;
   state.modelsSelId = state.models[0] ? state.models[0].id : null;
   state.modelsSelStepId = (state.models[0] && state.models[0].steps[0]) ? state.models[0].steps[0].id : null;
+  if (active && active.timers) {
+    state.timerModelId = active.timerModelId || state.timerModelId;
+    state.activeStudyId = active.activeStudyId || null;
+    state.timers = active.timers || {};
+    Object.keys(state.timers).forEach(function(k){
+      var t = state.timers[k];
+      if (t && !t.paused) { t.pausedAccum = netStepMs(t); t.paused = true; }
+    });
+  }
+  if (state.activeStudyId && !state.studies.some(function(st){ return st.id === state.activeStudyId && st.status === "in-progress"; })) state.activeStudyId = null;
   render();
 }
 
@@ -290,6 +351,58 @@ function persistRecords(next){
   state.records = next;
   if (!lsSet(LS_RECORDS, next)) showToast("Couldn't save the recording", "err");
 }
+function persistStudies(next){
+  state.studies = next;
+  if (!lsSet(LS_STUDIES, next)) showToast("Couldn't save the study", "err");
+}
+function persistActiveState(){
+  lsSet(LS_ACTIVE, { timerModelId: state.timerModelId, activeStudyId: state.activeStudyId, timers: state.timers });
+}
+function persistSettings(){ lsSet(LS_SETTINGS, { operatorName: state.operatorName || "" }); }
+function getActiveStudy(){
+  return state.studies.find(function(st){ return st.id === state.activeStudyId && st.status === "in-progress"; }) || null;
+}
+function createStudyForModel(modelId){
+  var model = state.models.find(function(m){ return m.id === modelId; });
+  if (!model) return null;
+  var now = new Date().toISOString();
+  var count = state.studies.filter(function(st){ return st.modelId === modelId; }).length + 1;
+  var study = { id: uid(), modelId:modelId, modelName:model.name, name:model.name+" — Study "+pad(count,3), status:"in-progress", startedAt:now, lastActivityAt:now, completedAt:null, operatorName:state.operatorName||"" };
+  persistStudies(state.studies.concat([study]));
+  state.activeStudyId = study.id;
+  persistActiveState();
+  return study;
+}
+function ensureActiveStudy(modelId){
+  var active = getActiveStudy();
+  if (active && active.modelId === modelId) return active;
+  var latest = state.studies.filter(function(st){ return st.modelId === modelId && st.status === "in-progress"; }).sort(function(a,b){ return new Date(b.lastActivityAt||b.startedAt)-new Date(a.lastActivityAt||a.startedAt); })[0];
+  if (latest){ state.activeStudyId = latest.id; persistActiveState(); return latest; }
+  return createStudyForModel(modelId);
+}
+function touchStudy(){
+  if (!state.activeStudyId) return;
+  var now = new Date().toISOString();
+  persistStudies(state.studies.map(function(st){ return st.id === state.activeStudyId ? Object.assign({},st,{lastActivityAt:now,operatorName:state.operatorName||st.operatorName||""}) : st; }));
+}
+window.startNewStudy = function(){
+  var model=getTimerModel(); if(!model) return;
+  if(anyTimerActive()){showToast("Stop or discard running timers before starting a new study","err");return;}
+  createStudyForModel(model.id); state.sessionStart=Date.now(); state.lastReading=null; renderTab();
+};
+window.continueStudy = function(id){
+  if(anyTimerActive()){showToast("Stop or discard running timers before changing studies","err");return;}
+  var study=state.studies.find(function(st){return st.id===id&&st.status==="in-progress";}); if(!study)return;
+  state.activeStudyId=id; state.timerModelId=study.modelId; persistActiveState(); renderTab();
+};
+window.finishStudy = function(){
+  if(!state.activeStudyId)return;
+  if(anyTimerActive()){showToast("Stop or discard running timers before finishing the study","err");return;}
+  var id=state.activeStudyId, now=new Date().toISOString();
+  persistStudies(state.studies.map(function(st){return st.id===id?Object.assign({},st,{status:"completed",completedAt:now,lastActivityAt:now}):st;}));
+  state.activeStudyId=null; persistActiveState(); showToast("Study completed"); renderTab();
+};
+window.setOperatorName = function(v){ state.operatorName=String(v||"").trim(); persistSettings(); touchStudy(); };
 
 function showToast(text, kind){
   var old = document.getElementById("cts-toast");
@@ -317,6 +430,30 @@ function anyTimerRunning(){
 }
 function anyTimerActive(){ return Object.keys(state.timers).length > 0; }
 
+window.toggleStudyMode = function(){
+  if (anyTimerActive()){ showToast("Stop or discard the running timer before changing Study mode", "err"); return; }
+  state.studyMode = !state.studyMode;
+  if (!state.studyMode){
+    state.activeStudyId = null;
+    persistActiveState();
+  } else {
+    var model = getTimerModel();
+    var latest = model ? state.studies.filter(function(st){ return st.modelId===model.id && st.status==="in-progress"; }).sort(function(a,b){ return new Date(b.lastActivityAt||b.startedAt)-new Date(a.lastActivityAt||a.startedAt); })[0] : null;
+    state.activeStudyId = latest ? latest.id : null;
+    persistActiveState();
+  }
+  renderTab();
+};
+
+window.toggleSessionMode = function(){
+  if (anyTimerActive()){
+    showToast("Stop or discard the running timer before changing Session Details", "err");
+    return;
+  }
+  state.sessionMode = !state.sessionMode;
+  renderTab();
+};
+
 function clearTick(){ if (tickTimer){ clearInterval(tickTimer); tickTimer = null; } }
 function startTick(){
   clearTick();
@@ -341,14 +478,19 @@ function startTick(){
 window.timerSelectModel = function(id){
   if (anyTimerActive()){ showToast("Stop or discard running timers before switching models", "err"); return; }
   state.timerModelId = id;
+  var inProgress = state.studyMode ? state.studies.filter(function(st){ return st.modelId===id && st.status==="in-progress"; }).sort(function(a,b){ return new Date(b.lastActivityAt||b.startedAt)-new Date(a.lastActivityAt||a.startedAt); })[0] : null;
+  state.activeStudyId = inProgress ? inProgress.id : null;
   state.sessionStart = Date.now();
   state.lastReading = null;
+  persistActiveState();
   renderTab();
 };
 
 window.startStep = function(stepId){
-  state.timers[stepId] = { pausedAccum: 0, runningSince: Date.now(), paused: false };
-  renderTab();
+  var model=getTimerModel(); if(!model)return;
+  if (state.studyMode) ensureActiveStudy(model.id);
+  state.timers[stepId] = { pausedAccum:0, runningSince:Date.now(), paused:false };
+  touchStudy(); persistActiveState(); renderTab();
 };
 
 window.stopAndRecordStep = function(stepId){
@@ -359,14 +501,15 @@ window.stopAndRecordStep = function(stepId){
   var durationSec = stepMsFor(stepId)/1000;
   var detail = getStepDetails(stepId);
   var rec = {
-    id: uid(), cycleId: "rep-"+uid(), modelId: model.id, modelName: model.name,
+    id: uid(), cycleId: "rep-"+uid(), studyId: state.activeStudyId||"", operatorName:state.operatorName||"", modelId: model.id, modelName: model.name,
     stepId: step.id, stepName: step.name, station: step.station,
     target: (step.target !== undefined && step.target !== null) ? step.target : null,
-    duration: durationSec, netDuration: durationSec, timestamp: new Date().toISOString(),
+    duration: durationSec, netDuration: durationSec, timestamp: new Date().toISOString(), recordedDate:todayStr(),
     hc: detail.hc, workerId: detail.worker, session: detail.session, comment: detail.comment
   };
   persistRecords(state.records.concat([rec]));
   delete state.timers[stepId];
+  touchStudy(); persistActiveState();
 
   var n = state.records.filter(function(r){
     return r.modelId === model.id && r.stepId === step.id &&
@@ -381,14 +524,13 @@ window.stopAndRecordStep = function(stepId){
 window.togglePause = function(stepId){
   var t = state.timers[stepId];
   if (!t) return;
-  if (t.paused){ t.runningSince = Date.now(); t.paused = false; }
-  else { t.pausedAccum = stepMsFor(stepId); t.paused = true; }
-  renderTab();
+  if (t.paused){ t.runningSince=Date.now(); t.paused=false; }
+  else { t.pausedAccum=stepMsFor(stepId); t.paused=true; }
+  touchStudy(); persistActiveState(); renderTab();
 };
 
 window.discardTiming = function(stepId){
-  delete state.timers[stepId];
-  renderTab();
+  delete state.timers[stepId]; touchStudy(); persistActiveState(); renderTab();
 };
 
 window.resetProgress = function(){ state.sessionStart = Date.now(); renderTab(); };
@@ -402,14 +544,16 @@ window.manualSubmit = function(){
   var input = document.getElementById("manual-duration");
   var d = input ? parseFloat(input.value) : NaN;
   if (!model || !step || !d || d <= 0) return;
+  if (state.studyMode) ensureActiveStudy(model.id);
   var rec = {
-    id: uid(), cycleId: "manual-"+uid(), modelId: model.id, modelName: model.name,
+    id: uid(), cycleId: "manual-"+uid(), studyId:state.activeStudyId||"", operatorName:state.operatorName||"", modelId: model.id, modelName: model.name,
     stepId: step.id, stepName: step.name, station: step.station,
     target: (step.target!==undefined && step.target!==null) ? step.target : null,
-    duration: d, netDuration: d, timestamp: new Date().toISOString(),
+    duration: d, netDuration: d, timestamp: new Date().toISOString(), recordedDate:todayStr(),
     hc: getStepDetails(step.id).hc, workerId: getStepDetails(step.id).worker, session: getStepDetails(step.id).session, comment: getStepDetails(step.id).comment
   };
   persistRecords(state.records.concat([rec]));
+  touchStudy(); persistActiveState();
   showToast("Manual entry added");
   renderTab();
 };
@@ -449,13 +593,12 @@ window.timerInsertStepAt = function(index){
 };
 
 function computeProgress(model){
-  var map = {};
-  var steps = model ? model.steps : [];
-  steps.forEach(function(s){
-    map[s.id] = state.records.filter(function(r){
-      return r.modelId === model.id && r.stepId === s.id &&
-        String(r.cycleId).indexOf("manual-") !== 0 &&
-        new Date(r.timestamp).getTime() >= state.sessionStart;
+  var map={};
+  var steps=model?model.steps:[];
+  steps.forEach(function(st){
+    map[st.id]=state.records.filter(function(r){
+      var inStudy=state.activeStudyId ? r.studyId===state.activeStudyId : new Date(r.timestamp).getTime()>=state.sessionStart;
+      return r.modelId===model.id && r.stepId===st.id && String(r.cycleId).indexOf("manual-")!==0 && inStudy;
     }).length;
   });
   return map;
@@ -468,22 +611,45 @@ window.modelsSelect = function(id){
   state.modelsSelId = id;
   var m = state.models.find(function(x){ return x.id === id; });
   state.modelsSelStepId = (m && m.steps[0]) ? m.steps[0].id : null;
+  // Keep the Timer tab pointed at the model the user is editing.
+  if (!anyTimerActive()){
+    state.timerModelId = id;
+    state.activeStudyId = null;
+    state.sessionStart = Date.now();
+    state.lastReading = null;
+    persistActiveState();
+  }
   renderTab();
 };
 window.addModel = function(){
   var m = { id: uid(), name: "New model", code: "", targetSamples: 5, steps: [] };
   persistModels(state.models.concat([m]));
+  // A newly created model becomes the selected model on both Models and Timer.
   state.modelsSelId = m.id;
   state.modelsSelStepId = null;
+  state.timerModelId = m.id;
+  state.activeStudyId = null;
+  state.sessionStart = Date.now();
+  state.lastReading = null;
+  persistActiveState();
   renderTab();
 };
 window.removeModel = function(id){
+  var wasTimerModel = state.timerModelId === id;
   var next = state.models.filter(function(m){ return m.id !== id; });
   persistModels(next);
   if (state.modelsSelId === id){
     state.modelsSelId = next[0] ? next[0].id : null;
     state.modelsSelStepId = next[0] && next[0].steps[0] ? next[0].steps[0].id : null;
   }
+  // If the Timer was pointing at the deleted model, move it to a valid model.
+  if (wasTimerModel || !next.some(function(m){ return m.id === state.timerModelId; })){
+    state.timerModelId = next[0] ? next[0].id : null;
+    state.activeStudyId = null;
+    state.sessionStart = Date.now();
+    state.lastReading = null;
+  }
+  persistActiveState();
   renderTab();
 };
 window.updateModelField = function(id, field, val){
@@ -554,31 +720,46 @@ window.moveStep = function(idx, dir){
   renderTab();
 };
 window.downloadStepsTemplate = function(){
-  var header = ["Model","Stage","Station","Step","Order","Target (s)","Reps"];
+  var headers = ["Model","Stage","Station","Step","Order","Target (s)","Reps","Session","HC","CT1","CT2","CT3","CT4","CT5","Comment"];
   var rows = [
-    ["Model A","Chassis Assembly","Station 1","Frame prep",1,22,5],
-    ["Model A","Sub-Assembly","Station 2","Sub-assembly",2,35,5],
-    ["Model A","Final Assembly","Station 3","Final assembly",3,28,5],
-    ["Model A","Quality Check","QC","Inspection",4,15,5],
-    ["Model B","","Station 1","Example step — replace me",1,"",5]
+    ["Model A","Chassis Assembly","Station 1","Frame prep",1,22,5,"Run 1",1,21.4,23.1,22.8,21.9,22.5,"Example comment"],
+    ["Model A","Sub-Assembly","Station 2","Sub-assembly",2,35,5,"",1,"","","","","",""],
+    ["Model B","Final Assembly","Station 3","Example step",1,"",5,"",1,"","","","","",""]
   ];
-  var lines = [header.join(",")];
-  rows.forEach(function(r){ lines.push(r.map(csvEscape).join(",")); });
-  downloadText("cycle-time-steps-template.csv", lines.join("\n"));
-  showToast("Template downloaded — fill it in, then use Import steps");
+  downloadExcel("cycle-time-import-template.xls", "Cycle Time Studio — Import Template", headers, rows);
+  showToast("Excel template downloaded — enter steps only, or add CT readings in CT1, CT2, CT3…");
 };
 window.downloadRecordsTemplate = function(){
-  var header = ["Model","Station","Step","Target (s)","Rep1","Rep2","Rep3","Rep4","Rep5"];
-  var rows = [
-    ["Model A","Station 1","Frame prep",22,21.4,23.1,22.8,21.9,22.5],
-    ["Model A","Station 2","Sub-assembly",35,34.8,36.0,35.2,"",""],
-    ["Model A","Station 3","Final assembly",28,27.5,28.9,28.0,27.8,28.3]
-  ];
-  var lines = [header.join(",")];
-  rows.forEach(function(r){ lines.push(r.map(csvEscape).join(",")); });
-  downloadText("cycle-time-records-template.csv", lines.join("\n"));
-  showToast("Template downloaded — one row per step, one column per repeat reading");
+  window.downloadStepsTemplate();
 };
+window.downloadReportExcel = function(){
+  var filtered = getFilteredRecords();
+  var groups = {};
+  filtered.slice().sort(function(a,b){ return new Date(a.timestamp)-new Date(b.timestamp); }).forEach(function(r){
+    var stage = getStepStage(r.modelId, r.stepId);
+    var session = r.session || "";
+    var hc = r.hc != null ? r.hc : "";
+    var key = [r.modelId, r.stepId, session, hc].join("|");
+    if (!groups[key]) groups[key] = { modelName:r.modelName, stage:stage, stepName:r.stepName, session:session, hc:hc, vals:[], comments:[] };
+    groups[key].vals.push(r.netDuration != null ? r.netDuration : r.duration);
+    if (r.comment) groups[key].comments.push(r.comment);
+  });
+  var headers = ["Model","Stage","Step","Session","HC"];
+  var maxCT = Object.keys(groups).reduce(function(n,k){ return Math.max(n, groups[k].vals.length); }, 0);
+  for (var i=1;i<=Math.max(maxCT,5);i++) headers.push("CT"+i);
+  headers.push("Average CT","SD","Comment");
+  var rows = Object.keys(groups).map(function(k){
+    var g = groups[k], row = [g.modelName,g.stage,g.stepName,g.session,g.hc];
+    for (var i=0;i<Math.max(maxCT,5);i++) row.push(g.vals[i] !== undefined ? Number(g.vals[i].toFixed(2)) : "");
+    row.push(g.vals.length ? Number(mean(g.vals).toFixed(2)) : "");
+    row.push(g.vals.length > 1 ? Number(sd(g.vals).toFixed(2)) : "");
+    row.push(g.comments.filter(function(v,i,a){return a.indexOf(v)===i;}).join(" | "));
+    return row;
+  });
+  downloadExcel("cycle-time-report-"+todayStr()+".xls", "Cycle Time Studio — Cycle Time Report", headers, rows);
+  showToast("Excel report exported");
+};
+
 
 /* ---------------------------------------------------------------------- */
 /* Report tab logic                                                        */
@@ -609,11 +790,27 @@ function getFilteredRecords(){
     return true;
   });
 }
+function recordCT(r){ return (r && r.netDuration != null) ? Number(r.netDuration) : Number(r.duration); }
 function getStepStage(modelId, stepId){
   var m = state.models.find(function(mm){ return mm.id === modelId; });
   if (!m) return "";
   var s = m.steps.find(function(ss){ return ss.id === stepId; });
   return s ? (s.stage || "") : "";
+}
+
+function dateKey(ts){ var d=new Date(ts); return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate()); }
+function prettyDate(k){ var p=k.split("-"); return p.length===3?p[1]+"/"+p[2]+"/"+p[0]:k; }
+function buildDailyComparisonCard(model, filtered){
+  var recs=filtered.filter(function(r){return r.modelId===model.id;});
+  var byDate={}; recs.forEach(function(r){var k=dateKey(r.timestamp);(byDate[k]||(byDate[k]=[])).push(r);});
+  var keys=Object.keys(byDate).sort();
+  if(keys.length<2)return '<div class="card" style="margin-top:14px;font-size:12.5px;opacity:.7">Select a model with readings on at least 2 different dates to compare day-to-day CT.</div>';
+  var rows=model.steps.map(function(st){var vals={};keys.forEach(function(k){var a=byDate[k].filter(function(r){return r.stepId===st.id;}).map(recordCT);vals[k]=a.length?mean(a):null;});return {step:st,vals:vals};});
+  var totals={};keys.forEach(function(k){var a=rows.map(function(x){return x.vals[k];}).filter(function(v){return v!==null;});totals[k]=a.length?a.reduce(function(x,y){return x+y;},0):null;});
+  var head='<th>Step</th>'+keys.map(function(k){return '<th class="num">'+esc(prettyDate(k))+'</th>';}).join("");
+  var body=rows.map(function(x){return '<tr><td>'+esc(x.step.station)+' · '+esc(x.step.name)+'</td>'+keys.map(function(k){return '<td class="num mono" style="font-weight:600">'+(x.vals[k]!==null?fmtSec(x.vals[k]):'—')+'</td>';}).join("")+'</tr>';}).join("");
+  body+='<tr style="font-weight:700;background:#f4f1e8"><td>Estimated total CT (sum of step averages)</td>'+keys.map(function(k){return '<td class="num mono">'+(totals[k]!==null?fmtSec(totals[k]):'—')+'</td>';}).join("")+'</tr>';
+  return '<div class="card tbl-wrap" style="margin-top:14px"><div style="font-size:13px;font-weight:700">Day-to-day CT comparison — '+esc(model.name)+'</div><div style="font-size:11.5px;opacity:.6;margin:3px 0 8px">Each cell is the average net CT for that step on that date. The total row is the sum of step averages, not a measured single-server cycle unless the steps represent one complete serial cycle.</div><table><thead><tr>'+head+'</tr></thead><tbody>'+body+'</tbody></table></div>';
 }
 
 function computeStepStats(filtered, groupBy){
@@ -635,7 +832,7 @@ function computeStepStats(filtered, groupBy){
         target: r.target, vals: []
       };
     }
-    groups[key].vals.push(r.duration);
+    groups[key].vals.push(recordCT(r));
     if (groupBy !== "step" && (groups[key].target===null || groups[key].target===undefined) && r.target!==null && r.target!==undefined){
       groups[key].target = r.target;
     }
@@ -655,7 +852,7 @@ function computeCycleStats(filtered){
   filtered.forEach(function(r){
     if (String(r.cycleId).indexOf("manual-") === 0) return;
     if (!byCycle[r.cycleId]) byCycle[r.cycleId] = { modelId:r.modelId, modelName:r.modelName, total:0, steps:0 };
-    byCycle[r.cycleId].total += r.duration; byCycle[r.cycleId].steps += 1;
+    byCycle[r.cycleId].total += recordCT(r); byCycle[r.cycleId].steps += 1;
   });
   var stepCounts = {};
   state.models.forEach(function(m){ stepCounts[m.id] = m.steps.length; });
@@ -746,7 +943,7 @@ function buildFluctuationSVG(model, filtered){
   var perStep = steps.map(function(s){
     var vals = filtered.filter(function(r){ return r.modelId === model.id && r.stepId === s.id; })
       .sort(function(a,b){ return new Date(a.timestamp)-new Date(b.timestamp); })
-      .map(function(r){ return r.duration; });
+      .map(function(r){ return recordCT(r); });
     return { step:s, vals:vals };
   });
   var maxReps = Math.min(8, Math.max.apply(null, perStep.map(function(p){ return p.vals.length; }).concat([0])));
@@ -835,10 +1032,11 @@ function buildDonutSVG(byStation){
 }
 
 window.exportRecordsCSV = function(){
-  var header = ["Model","Station","Step","Duration (s)","Target (s)","Timestamp","CycleId","HC","Worker","Session","Comment"];
+  var header = ["Study","Operator","Date","Model","Station","Step","Duration (s)","Target (s)","Timestamp","CycleId","HC","Worker","Session","Comment"];
   var lines = [header.join(",")];
   state.records.forEach(function(r){
-    lines.push([r.modelName, r.station, r.stepName, (r.netDuration != null ? r.netDuration : r.duration).toFixed(3), r.target!=null?r.target:"", r.timestamp, r.cycleId,
+    var st = state.studies.find(function(x){return x.id===r.studyId;});
+    lines.push([st?st.name:"", r.operatorName||"", dateKey(r.timestamp), r.modelName, r.station, r.stepName, (r.netDuration != null ? r.netDuration : r.duration).toFixed(3), r.target!=null?r.target:"", r.timestamp, r.cycleId,
       r.hc!=null?r.hc:"", r.workerId||"", r.session||"", r.comment||""].map(csvEscape).join(","));
   });
   downloadText("cycle-time-records-"+todayStr()+".csv", lines.join("\n"));
@@ -889,6 +1087,30 @@ window.exportTimeStudyCSV = function(){
   downloadText("cycle-time-study-"+slugKey(selectedModel.name)+"-"+todayStr()+".csv", lines.join("\n"));
   showToast("Time study sheet exported (CSV)");
 };
+window.exportLocalBackup = function(){
+  var payload = { app:"Cycle Time Studio", version:2, exportedAt:new Date().toISOString(), operatorName:state.operatorName||"", models:state.models, studies:state.studies, records:state.records };
+  downloadText("cycle-time-studio-backup-"+todayStr()+".json", JSON.stringify(payload,null,2));
+  showToast("Local backup downloaded");
+};
+window.triggerImportBackup = function(){ document.getElementById("import-backup-input").click(); };
+window.handleImportBackup = function(evt){
+  var file=evt.target.files&&evt.target.files[0]; if(!file)return;
+  var reader=new FileReader();
+  reader.onload=function(){
+    try{
+      var p=JSON.parse(String(reader.result));
+      if(!p || p.app!=="Cycle Time Studio" || !Array.isArray(p.models) || !Array.isArray(p.records)) throw new Error("invalid backup");
+      if(!window.confirm("Restore this backup? Your current local models, studies, and readings will be replaced.")) return;
+      state.models=p.models; state.records=p.records; state.studies=Array.isArray(p.studies)?p.studies:[]; state.operatorName=p.operatorName||state.operatorName||"";
+      lsSet(LS_MODELS,state.models); lsSet(LS_RECORDS,state.records); lsSet(LS_STUDIES,state.studies); persistSettings();
+      state.activeStudyId=null; state.timers={}; persistActiveState();
+      state.timerModelId=state.models[0]?state.models[0].id:null; state.modelsSelId=state.timerModelId; state.modelsSelStepId=state.models[0]&&state.models[0].steps[0]?state.models[0].steps[0].id:null;
+      showToast("Backup restored"); render();
+    }catch(e){showToast("Backup restore failed — invalid backup file","err");}
+    finally{evt.target.value="";}
+  };
+  reader.readAsText(file);
+};
 window.triggerImportRecords = function(){ document.getElementById("import-records-input").click(); };
 window.triggerImportModels = function(){ document.getElementById("import-models-input").click(); };
 
@@ -918,7 +1140,7 @@ window.handleImportRecords = function(evt){
   var reader = new FileReader();
   reader.onload = function(){
     try {
-      var rows = parseCSV(String(reader.result));
+      var rows = parseImportFile(String(reader.result), file.name);
       var isWide = rows.length && Object.keys(rows[0]).some(function(k){ return /^rep\s*\d+$/i.test(k.trim()); });
       var newRecs = [];
 
@@ -971,21 +1193,41 @@ window.handleImportModels = function(evt){
   var reader = new FileReader();
   reader.onload = function(){
     try {
-      var rows = parseCSV(String(reader.result));
+      var rows = parseImportFile(String(reader.result), file.name);
       var byModel = {};
+      var importedRecords = [];
       rows.forEach(function(row){
         var name = (row["Model"]||"").trim();
         if (!name) return;
         if (!byModel[name]) byModel[name] = { id: uid(), name: name, code:"", targetSamples:5, steps:[] };
+        var newStepId = uid();
         byModel[name].steps.push({
-          id: uid(), stage: (row["Stage"]||"").trim(), station: (row["Station"]||"Station").trim(), name: (row["Step"]||"Step").trim(),
+          id: newStepId, stage: (row["Stage"]||"").trim(), station: (row["Station"]||"Station").trim(), name: (row["Step"]||"Step").trim(),
           target: row["Target (s)"] !== undefined && row["Target (s)"] !== "" ? Number(row["Target (s)"]) : null,
-          reps: row["Reps"] !== undefined && row["Reps"] !== "" ? Math.max(1, parseInt(row["Reps"],10)||1) : 5
+          reps: row["Reps"] !== undefined && row["Reps"] !== "" ? Math.max(1, parseInt(row["Reps"],10)||1) : 5,
+          hc: row["HC"] !== undefined && row["HC"] !== "" ? Math.max(1, parseInt(row["HC"],10)||1) : 1,
+          worker: "", session: (row["Session"]||"").trim(), comment: (row["Comment"]||"").trim()
+        });
+        var importedRepKeys = Object.keys(row).filter(function(k){ return /^ct\s*\d+$/i.test(k.trim()); })
+          .sort(function(a,b){ return parseInt(a.replace(/\D/g,""),10)-parseInt(b.replace(/\D/g,""),10); });
+        importedRepKeys.forEach(function(k){
+          var v = parseFloat(row[k]);
+          if (!isNaN(v) && v > 0){
+            importedRecords.push({
+              id: uid(), cycleId: "import-"+uid(), modelId: byModel[name].id, modelName:name, stepId:newStepId,
+              stepName:(row["Step"]||"Step").trim(), station:(row["Station"]||"Station").trim(),
+              target: row["Target (s)"] !== undefined && row["Target (s)"] !== "" ? Number(row["Target (s)"]) : null,
+              duration:v, netDuration:v, timestamp:new Date(Date.now()+importedRecords.length*1000).toISOString(),
+              hc: row["HC"] !== undefined && row["HC"] !== "" ? Math.max(1,parseInt(row["HC"],10)||1) : 1,
+              workerId:"", session:(row["Session"]||"").trim(), comment:(row["Comment"]||"").trim()
+            });
+          }
         });
       });
       var list = Object.keys(byModel).map(function(k){ return byModel[k]; });
       if (list.length){
         persistModels(list);
+        if (importedRecords.length) persistRecords(state.records.concat(importedRecords));
         state.modelsSelId = list[0].id;
         state.timerModelId = list[0].id;
         showToast("Imported "+list.length+" model(s)");
@@ -1016,8 +1258,9 @@ function render(){
       state.tab === "models" ? renderModelsTab() :
       renderReportTab()
     ) + '</main>'
-    + '<input id="import-records-input" type="file" accept=".csv" style="display:none" onchange="handleImportRecords(event)" />'
-    + '<input id="import-models-input" type="file" accept=".csv" style="display:none" onchange="handleImportModels(event)" />';
+    + '<input id="import-records-input" type="file" accept=".csv,.xls" style="display:none" onchange="handleImportRecords(event)" />'
+    + '<input id="import-models-input" type="file" accept=".csv,.xls" style="display:none" onchange="handleImportModels(event)" />'
+    + '<input id="import-backup-input" type="file" accept=".json,application/json" style="display:none" onchange="handleImportBackup(event)" />';
   wireAfterRender();
 }
 function renderTab(){ render(); }
@@ -1062,13 +1305,39 @@ function renderTimerTab(){
     + (state.models.length ? modelOptions : '<option>No models yet</option>') + '</select>'
     + (anyActive ? '<div style="font-size:11px;opacity:.55;margin-top:4px">Stop or discard running stations to switch models.</div>' : "")
     + '</div>'
+    + '<div style="border-top:1px solid var(--line);padding-top:10px;display:flex;flex-direction:column;gap:8px">'
+    + '<div class="row" style="justify-content:space-between;align-items:center;gap:8px">'
+    + '<div><div class="field-label">Study</div><div style="font-size:11px;opacity:.55">Optional — turn on only when you want a multi-day study.</div></div>'
+    + '<button class="btn btn-outline" style="padding:5px 9px;font-size:11px" onclick="toggleStudyMode()">'+(state.studyMode?'On':'Off')+'</button>'
+    + '</div>'
+    + (state.studyMode ? (
+        '<div style="display:flex;flex-direction:column;gap:7px">'
+        + '<div class="field-label">Operator / User</div>'
+        + '<input type="text" value="'+esc(state.operatorName)+'" placeholder="Your name or ID" onchange="setOperatorName(this.value)" />'
+        + (getActiveStudy() ? '<div style="font-size:12px;font-weight:600;color:var(--teal-dark)">'+esc(getActiveStudy().name)+'</div><div style="font-size:11px;opacity:.55">Started '+new Date(getActiveStudy().startedAt).toLocaleDateString()+' · Last activity '+new Date(getActiveStudy().lastActivityAt).toLocaleString()+'</div>' : '<div style="font-size:11.5px;opacity:.55">No active study yet. Start a timer or create a new study.</div>')
+        + '<div class="row" style="gap:6px;flex-wrap:wrap"><button class="btn btn-outline" style="padding:6px 9px;font-size:11.5px" onclick="startNewStudy()">New study</button>'
+        + (getActiveStudy() ? '<button class="btn btn-outline" style="padding:6px 9px;font-size:11.5px" onclick="finishStudy()">Finish study</button>' : '') + '</div>'
+        + '</div>'
+        + '<div style="border-top:1px solid var(--line);padding-top:8px;display:flex;flex-direction:column;gap:6px">'
+        + '<div class="field-label">In-progress studies</div>'
+        + (state.studies.filter(function(st){ return st.status === "in-progress"; }).length ? state.studies.filter(function(st){ return st.status === "in-progress"; }).sort(function(a,b){ return new Date(b.lastActivityAt||b.startedAt)-new Date(a.lastActivityAt||a.startedAt); }).map(function(st){ return '<button class="model-list-btn" data-active="'+(st.id===state.activeStudyId?'1':'0')+'" onclick="continueStudy(\''+st.id+'\')"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(st.name)+'</span><span style="font-size:10px;opacity:.55">'+new Date(st.lastActivityAt||st.startedAt).toLocaleDateString()+'</span></button>'; }).join("") : '<div style="font-size:11px;opacity:.55">No in-progress studies.</div>')
+        + '</div>'
+      ) : '')
+    + '</div>'
     + (model ? (
         '<div style="font-size:12px;font-weight:500;color:'+(allMet?"var(--teal-dark)":"#6b665b")+'">'+stepsMet+'/'+steps.length+' steps have the reps they need'+(allMet?" — stage complete ✓":"")+'</div>'
         + '<button class="btn-link" style="align-self:flex-start" onclick="resetProgress()">Reset progress</button>'
       ) : "")
     + '<div style="border-top:1px solid var(--line);padding-top:10px;display:flex;flex-direction:column;gap:8px">'
-    + '<div class="field-label">Step details</div>'
-    + '<div style="font-size:11px;opacity:.55">Details are now recorded separately for each step.</div>'
+    + '<div class="field-label">In-progress studies</div>'
+    + (state.studies.filter(function(st){ return st.status === "in-progress"; }).length ? state.studies.filter(function(st){ return st.status === "in-progress"; }).sort(function(a,b){ return new Date(b.lastActivityAt||b.startedAt)-new Date(a.lastActivityAt||a.startedAt); }).map(function(st){ return '<button class="model-list-btn" data-active="'+(st.id===state.activeStudyId?"1":"0")+'" onclick="continueStudy(\''+st.id+'\')"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(st.name)+'</span><span style="font-size:10px;opacity:.55">'+new Date(st.lastActivityAt||st.startedAt).toLocaleDateString()+'</span></button>'; }).join("") : '<div style="font-size:11px;opacity:.55">No in-progress studies.</div>')
+    + '</div>'
+    + '<div style="border-top:1px solid var(--line);padding-top:10px;display:flex;flex-direction:column;gap:8px">'
+    + '<div class="row" style="justify-content:space-between;align-items:center;gap:8px">'
+    + '<div><div class="field-label">Session details</div><div style="font-size:11px;opacity:.55">Optional — turn on only when needed.</div></div>'
+    + '<button class="btn btn-outline" style="padding:5px 9px;font-size:11px" onclick="toggleSessionMode()">'+(state.sessionMode?'On':'Off')+'</button>'
+    + '</div>'
+    + (state.sessionMode ? '<div style="font-size:11px;opacity:.55">HC, Worker, Session/Run and Step Note appear under each step.</div>' : '')
     + '</div>'
     + '</div>';
 
@@ -1108,19 +1377,18 @@ function renderTimerTab(){
     }
 
     var sessionReadings = state.records.filter(function(r){
-      return r.modelId === model.id && r.stepId === s.id &&
-        String(r.cycleId).indexOf("manual-") !== 0 &&
-        new Date(r.timestamp).getTime() >= state.sessionStart;
+      var inStudy=state.activeStudyId ? r.studyId===state.activeStudyId : new Date(r.timestamp).getTime()>=state.sessionStart;
+      return r.modelId===model.id && r.stepId===s.id && String(r.cycleId).indexOf("manual-")!==0 && inStudy;
     }).sort(function(a,b){ return new Date(a.timestamp) - new Date(b.timestamp); });
     var expanded = !!state.expandedSteps[s.id];
 
     var stepDetail = getStepDetails(s.id);
-    var stepDetailUI = '<div style="display:grid;grid-template-columns:70px 80px minmax(90px,1fr) minmax(90px,1fr);gap:6px;align-items:center;padding-top:6px;border-top:1px solid var(--line);margin-top:4px">'
+    var stepDetailUI = state.sessionMode ? '<div style="display:grid;grid-template-columns:70px 80px minmax(90px,1fr) minmax(90px,1fr);gap:6px;align-items:center;padding-top:6px;border-top:1px solid var(--line);margin-top:4px">'
       + '<input type="number" min="1" step="1" value="'+stepDetail.hc+'" title="Headcount" placeholder="HC" onchange="timerUpdateStepDetail(\''+s.id+'\',\'hc\',this.value)" />'
       + '<input type="text" value="'+esc(stepDetail.worker)+'" title="Worker" placeholder="Worker" onchange="timerUpdateStepDetail(\''+s.id+'\',\'worker\',this.value)" />'
       + '<input type="text" value="'+esc(stepDetail.session)+'" title="Session / lot / run" placeholder="Session / Run" onchange="timerUpdateStepDetail(\''+s.id+'\',\'session\',this.value)" />'
       + '<input type="text" value="'+esc(stepDetail.comment)+'" title="Step detail" placeholder="Step detail / note" onchange="timerUpdateStepDetail(\''+s.id+'\',\'comment\',this.value)" />'
-      + '</div>';
+      + '</div>' : "";
 
     var toggleLine = sessionReadings.length ? (
       '<button onclick="toggleStepReadings(\''+s.id+'\')" style="all:unset;cursor:pointer;font-size:11px;color:var(--teal-dark);font-weight:600;padding-top:2px">'
@@ -1172,7 +1440,7 @@ function renderTimerTab(){
   }).join("");
   var recent = state.records.slice().sort(function(a,b){ return new Date(b.timestamp)-new Date(a.timestamp); }).slice(0,8);
   var recentHtml = recent.length ? recent.map(function(r){
-    var over = r.target && r.duration > r.target;
+    var over = r.target && recordCT(r) > r.target;
     return '<div style="display:flex;justify-content:space-between;align-items:center;font-size:12.5px;padding:6px 0;border-bottom:1px solid var(--line)">'
       + '<div style="min-width:0"><div style="font-weight:500">'+esc(r.station)+' · '+esc(r.stepName)+'</div><div style="opacity:.55;font-size:11px">'+esc(r.modelName)+'</div></div>'
       + '<div class="mono" style="font-weight:600;color:'+(over?"var(--red)":"var(--teal-dark)")+'">'+fmtSec(r.duration)+'</div></div>';
@@ -1290,7 +1558,16 @@ function renderReportTab(){
     return '<option value="'+m.id+'" '+(state.reportFilterModel===m.id?"selected":"")+'>'+esc(m.name)+'</option>';
   }).join("");
 
-  var filters = '<div class="card row filters">'
+  var filters = '<div class="card" style="margin-bottom:12px;padding:14px 16px;background:linear-gradient(180deg,#fbfaf6,#f4f1e8);border:1px solid var(--line)">'
+    + '<div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">'
+    + '<div style="font-size:18px">'+ICO.chart+'</div>'
+    + '<div style="flex:1;min-width:240px"><div style="font-weight:700;font-size:14px">Cycle-time report</div>'
+    + '<div style="font-size:11.5px;opacity:.65;margin-top:3px">Export one Excel row per Model + Stage + Step + Session + HC. CT1, CT2, CT3… are the individual net readings; Average CT and SD are calculated from those readings.</div></div>'
+    + '<div style="display:flex;gap:7px;flex-wrap:wrap">'
+    + '<button class="btn btn-outline" onclick="downloadStepsTemplate()">'+ICO.dl+' Excel template</button>'
+    + '<button class="btn btn-primary" onclick="downloadReportExcel()">'+ICO.dl+' Export Excel</button>'
+    + '</div></div></div>'
+    + '<div class="card row filters">'
     + '<select onchange="setReportFilterModel(this.value)">'+modelOptions+'</select>'
     + '<label class="field-label">Group by</label>'
     + '<select onchange="setReportGroupBy(this.value)">'
@@ -1302,13 +1579,11 @@ function renderReportTab(){
     + '<span style="font-size:12px;opacity:.5">to</span>'
     + '<input type="date" value="'+state.reportDateTo+'" onchange="setReportDateTo(this.value)" />'
     + '<div style="flex:1"></div>'
-    + '<button class="btn btn-outline" onclick="downloadRecordsTemplate()">'+ICO.dl+' Records template</button>'
-    + '<button class="btn btn-outline" onclick="triggerImportRecords()">'+ICO.ul+' Import records</button>'
-    + '<button class="btn btn-outline" onclick="triggerImportModels()">'+ICO.ul+' Import steps</button>'
-    + '<button class="btn btn-primary" onclick="exportRecordsCSV()">'+ICO.dl+' Export records</button>'
-    + '<button class="btn btn-outline" onclick="exportSummaryCSV()">'+ICO.dl+' Export summary</button>'
-    + '<button class="btn btn-outline" onclick="exportModelsCSV()">'+ICO.dl+' Export steps</button>'
-    + '<button class="btn btn-outline" onclick="exportTimeStudyCSV()">'+ICO.dl+' Export time study sheet</button>'
+    + '<button class="btn btn-outline" onclick="triggerImportModels()">'+ICO.ul+' Import Excel</button>'
+    + '<button class="btn btn-outline" onclick="exportLocalBackup()">'+ICO.dl+' Backup</button>'
+    + '<button class="btn btn-outline" onclick="triggerImportBackup()">'+ICO.ul+' Restore</button>'
+    + '<button class="btn btn-outline" onclick="exportRecordsCSV()">'+ICO.dl+' Raw CSV</button>'
+    + '<button class="btn btn-outline" onclick="exportSummaryCSV()">'+ICO.dl+' Summary CSV</button>'
     + '</div>';
 
   if (!filtered.length){
@@ -1328,6 +1603,7 @@ function renderReportTab(){
     : "";
 
   var selectedModel = (state.reportFilterModel !== "all") ? state.models.find(function(m){ return m.id === state.reportFilterModel; }) : null;
+  var dailyComparison = selectedModel ? buildDailyComparisonCard(selectedModel, filtered) : '<div class="card" style="margin-top:14px;font-size:12.5px;opacity:.6">Pick a specific model above to compare its CT across multiple days.</div>';
   var fluctChart = selectedModel
     ? ('<div class="card" style="margin-top:14px"><div style="font-size:13px;font-weight:600;margin-bottom:6px">Fluctuation across readings — '+esc(selectedModel.name)+'</div>'+buildFluctuationSVG(selectedModel, filtered)+'</div>')
     : '<div class="card" style="margin-top:14px;font-size:12.5px;opacity:.6">Pick a specific model above to see the reading-by-reading fluctuation chart.</div>';
@@ -1367,14 +1643,14 @@ function renderReportTab(){
   var rawRows = filtered.slice().sort(function(a,b){ return new Date(b.timestamp)-new Date(a.timestamp); }).map(function(r){
     var over = r.target && r.duration > r.target;
     return '<tr><td class="mono" style="opacity:.7">'+new Date(r.timestamp).toLocaleString()+'</td><td>'+esc(r.modelName)+'</td><td>'+esc(r.station)+'</td><td>'+esc(r.stepName)+'</td>'
-      + '<td class="num mono" style="font-weight:600;color:'+(over?"var(--red)":"var(--ink)")+'">'+fmtSec(r.duration)+'</td>'
+      + '<td class="num mono" style="font-weight:600;color:'+(over?"var(--red)":"var(--ink)")+'">'+fmtSec(recordCT(r))+'</td>'
       + '<td style="text-align:right"><button class="btn-danger" style="padding:3px" onclick="deleteRecord(\''+r.id+'\')">'+ICO.trash+'</button></td></tr>';
   }).join("");
   var rawTable = '<div class="card tbl-wrap" style="margin-top:14px;max-height:340px;overflow-y:auto"><div style="font-size:13px;font-weight:600;margin-bottom:8px">Raw readings ('+filtered.length+')</div>'
     + '<table><thead><tr><th>Time</th><th>Model</th><th>Station</th><th>Step</th><th class="num">Duration</th><th></th></tr></thead>'
     + '<tbody>'+rawRows+'</tbody></table></div>';
 
-  return filters + barMaxChart + fluctChart + donutChart + stepTable + cycleTable + rawTable;
+  return filters + barMaxChart + dailyComparison + fluctChart + donutChart + stepTable + cycleTable + rawTable;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1389,6 +1665,13 @@ function wireAfterRender(){
   }
 }
 
+window.addEventListener("beforeunload",function(){
+  var changed=false; Object.keys(state.timers).forEach(function(k){var t=state.timers[k];if(t&&!t.paused){t.pausedAccum=netStepMs(t);t.paused=true;changed=true;}});
+  if(changed)touchStudy(); persistActiveState();
+});
+document.addEventListener("visibilitychange",function(){
+  if(document.hidden){var changed=false;Object.keys(state.timers).forEach(function(k){var t=state.timers[k];if(t&&!t.paused){t.pausedAccum=netStepMs(t);t.paused=true;changed=true;}});if(changed){touchStudy();persistActiveState();}}
+});
 init();
 })();
 </script>
